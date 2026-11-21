@@ -138,20 +138,6 @@ It prints `PASS` when a 4096-frame ramp comes back bit-exact.
   Manager after picking the device; if not, the error dialog explains why.
 * **Plugin silent after closing Max** — press "Restart Max".
 
-## Publishing on GitHub
-
-```bat
-git init
-git add .
-git commit -m "M4L Bridge P0"
-git remote add origin https://github.com/<you>/m4l-bridge.git
-git push -u origin main
-```
-
-`build/`, `dist/` and the scratch test folders are ignored. Attach the three
-`.vst3` bundles (zipped) to a GitHub **release** instead of committing them:
-they contain the JUCE runtime and are large binaries.
-
 ## License
 
 AGPL-3.0 (required by the JUCE 8 AGPL option). A JUCE commercial license removes
