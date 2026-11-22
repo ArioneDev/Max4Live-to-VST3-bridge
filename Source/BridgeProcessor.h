@@ -2,10 +2,13 @@
 
 #include <juce_audio_processors/juce_audio_processors.h>
 
-inline constexpr const char* kBridgeVersion = "0.8.4";
+inline constexpr const char* kBridgeVersion = "0.9.5";
 
 #include "SharedProtocol.h"
 #include "SharedTransport.h"
+
+#include <array>
+#include <atomic>
 
 // Host-side plugin.  It owns the shared-memory ring, spawns a Max process that
 // hosts the device, and pumps audio/MIDI between the host and that process.
@@ -152,11 +155,21 @@ private:
     std::atomic<bool> errorUnreported { false };
 
     m4lb::SharedTransport transport;
+    static constexpr int numParams = 32;
+
     std::unique_ptr<juce::DatagramSocket> oscSocket;
     int oscPort = 0;
     uint32_t shmKey = 0;
     uint32_t lastHeartbeat = 0;
     juce::int64 lastHeartbeatMs = 0;
+    int feedbackPort = 0;
+    std::unique_ptr<juce::Thread> feedbackThread;
+    std::array<std::atomic<float>, numParams> paramMin {};
+    std::array<std::atomic<float>, numParams> paramMax {};
+    std::array<float, numParams> lastSentParam {};
+    std::atomic<bool> paramsRequested { false };
+    std::atomic<bool> gotParamInfo { false };
+    juce::int64 lastGpMs = 0;
     double lastSentBpm = 0.0;
     juce::int64 lastTempoMs = 0;
     juce::CriticalSection transportLock;

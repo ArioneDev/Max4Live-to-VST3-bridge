@@ -77,9 +77,122 @@ static void rawLog (const char* msg)
                                    .withOutput ("Out", juce::AudioChannelSet::stereo(), true)
 #endif
 
+namespace
+{
+static juce::String readOscString (const char* d, int size, int& pos)
+{
+    const int start = pos;
+    while (pos < size && d[pos] != 0) ++pos;
+    juce::String s (d + start, (size_t) (pos - start));
+    ++pos;
+    while ((pos & 3) != 0) ++pos;
+    return s;
+}
+
+static int32_t readOscInt (const char* d, int& pos)
+{
+    const auto v = ((uint32_t) (uint8_t) d[pos] << 24)
+                 | ((uint32_t) (uint8_t) d[pos + 1] << 16)
+                 | ((uint32_t) (uint8_t) d[pos + 2] << 8)
+                 | (uint32_t) (uint8_t) d[pos + 3];
+    pos += 4;
+    return (int32_t) v;
+}
+
+static float readOscFloat (const char* d, int& pos)
+{
+    const uint32_t bits = (uint32_t) readOscInt (d, pos);
+    float f = 0.0f;
+    std::memcpy (&f, &bits, sizeof (f));
+    return f;
+}
+
+// Receives parameter info from Max (OSC over UDP).
+class ParamFeedbackThread : public juce::Thread
+{
+public:
+    using Callback = std::function<void (int, float, float, const juce::String&)>;
+
+    ParamFeedbackThread (int port, Callback cb)
+        : juce::Thread ("M4LParamFeedback"), port_ (port), callback_ (std::move (cb)) {}
+
+    void run() override
+    {
+        juce::DatagramSocket socket;
+
+        if (! socket.bindToPort (port_))
+        {
+            m4lb::log ("feedback socket bind failed on port " + juce::String (port_));
+            return;
+        }
+
+        char buffer[4096];
+
+        while (! threadShouldExit())
+        {
+            if (! socket.waitUntilReady (true, 100))
+                continue;
+
+            const int n = socket.read (buffer, (int) sizeof (buffer), false);
+
+            if (n > 0)
+                parse (buffer, n);
+        }
+    }
+
+private:
+    void parse (const char* data, int size)
+    {
+        int pos = 0;
+        auto address = readOscString (data, size, pos);
+
+        if (address.startsWith ("/"))
+            address = address.substring (1);
+
+        if (pos >= size || data[pos] != ',')
+            return;
+
+        auto tags = readOscString (data, size, pos);
+
+        if (address != "pd" || tags.length() < 4)
+            return;
+
+        // Max encodes numbers as int or float depending on the value, so the
+        // type tags must drive decoding.
+        const char t0 = tags[1], t1 = tags[2], t2 = tags[3];
+
+        auto readNumber = [&] (char t) -> double
+        {
+            if (t == 'i') return (double) readOscInt (data, pos);
+            return (double) readOscFloat (data, pos);
+        };
+
+        const int index = (t0 == 'i') ? readOscInt (data, pos) : (int) readOscFloat (data, pos);
+        const auto minV = (float) readNumber (t1);
+        const auto maxV = (float) readNumber (t2);
+        auto name = readOscString (data, size, pos);
+
+        if (index >= 0 && index < 32 && callback_)
+            callback_ (index, minV, maxV, name);
+    }
+    int port_;
+    Callback callback_;
+};
+} // namespace
 BridgeAudioProcessor::BridgeAudioProcessor()
     : juce::AudioProcessor (M4LB_BUSES)
 {
+    for (int i = 0; i < numParams; ++i)
+    {
+        paramMin[(size_t) i].store (0.0f);
+        paramMax[(size_t) i].store (1.0f);
+        lastSentParam[(size_t) i] = 0.0f;
+
+        addParameter (new juce::AudioParameterFloat ("p" + juce::String (i),
+                                                     "P " + juce::String (i + 1).paddedLeft ('0', 2),
+                                                     juce::NormalisableRange<float> (0.0f, 1.0f), 0.0f));
+    }
+
     // Handy for tests and for hosts that restore state late.
     if (auto env = juce::SystemStats::getEnvironmentVariable ("M4LBRIDGE_DEVICE", {}); env.isNotEmpty())
         devicePath = env;
@@ -271,6 +384,50 @@ void BridgeAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce:
 
     for (int c = 0; c < channels; ++c)
         outPeak = juce::jmax (outPeak, buffer.getMagnitude (c, 0, buffer.getNumSamples()));
+
+    // Re-request the parameter table until it arrives: the device may still
+    // be loading when the shim first connects.
+    if (attached && oscSocket != nullptr && oscPort > 0 && ! gotParamInfo.load())
+    {
+        const auto nowMs = juce::Time::currentTimeMillis();
+
+        if (nowMs - lastGpMs > 2000)
+        {
+            lastGpMs = nowMs;
+
+            std::vector<uint8_t> packet;
+            appendOscString (packet, "/gp");
+            appendOscString (packet, ",");
+            oscSocket->write ("127.0.0.1", oscPort, packet.data(), (int) packet.size());
+        }
+    }
+
+    if (attached && oscSocket != nullptr && oscPort > 0)
+    {
+        const auto& params = getParameters();
+        const int count = juce::jmin (numParams, (int) params.size());
+
+        for (int i = 0; i < count; ++i)
+        {
+            const float norm = params[i]->getValue();
+
+            if (std::abs (norm - lastSentParam[(size_t) i]) > 0.0005f)
+            {
+                lastSentParam[(size_t) i] = norm;
+
+                const float mn = paramMin[(size_t) i].load();
+                const float mx = paramMax[(size_t) i].load();
+                const float native = mn + norm * (mx - mn);
+
+                std::vector<uint8_t> packet;
+                appendOscString (packet, "/p");
+                appendOscString (packet, ",if");
+                appendOscInt (packet, i);
+                appendOscFloat (packet, native);
+                oscSocket->write ("127.0.0.1", oscPort, packet.data(), (int) packet.size());
+            }
+        }
+    }
 
     if (attached && oscSocket != nullptr && oscPort > 0)
     {
@@ -610,6 +767,8 @@ juce::File BridgeAudioProcessor::writePatchFile() const
     options.loopback = loopback;
     options.openDeviceUi = ! loopback;
     options.udpPort = oscPort;
+    options.feedbackPort = feedbackPort;
+    options.debugLog = juce::SystemStats::getEnvironmentVariable ("M4LBRIDGE_DEBUG", {}) == "1";
     options.instanceId = 0; // revert: shared memory keyed by Max pid again
 
     dir.getChildFile ("ctl.js").replaceWithText (m4lb::controlScript());
@@ -677,11 +836,34 @@ void BridgeAudioProcessor::startMaxSide()
 
     disableMaxWindowRestore();
 
+    gotParamInfo = false;
+    lastGpMs = 0;
+
     if (shmKey == 0)
         shmKey = 1u + (uint32_t) juce::Random::getSystemRandom().nextInt (999998);
 
     if (oscPort == 0)
         oscPort = pickFreeUdpPort();
+
+    if (feedbackPort == 0)
+        feedbackPort = pickFreeUdpPort();
+
+    if (feedbackThread == nullptr && feedbackPort > 0)
+    {
+        feedbackThread = std::make_unique<ParamFeedbackThread> (feedbackPort,
+            [this] (int idx, float minV, float maxV, const juce::String& nm)
+            {
+                gotParamInfo = true;
+                paramMin[(size_t) idx].store (minV);
+                paramMax[(size_t) idx].store (maxV);
+
+                if (idx < 4)
+                    m4lb::log ("param " + juce::String (idx) + " [" + juce::String (minV, 2)
+                               + ", " + juce::String (maxV, 2) + "] " + nm);
+            });
+
+        feedbackThread->startThread();
+    }
 
     if (oscSocket == nullptr && oscPort > 0)
     {
@@ -796,6 +978,15 @@ void BridgeAudioProcessor::startMaxSide()
                     connected = transport.isAttached()
                              && transport.layout()->header.sampleRate.load() > 0;
                 }
+            }
+
+            if (connected && oscSocket != nullptr && oscPort > 0)
+            {
+                std::vector<uint8_t> packet;
+                appendOscString (packet, "/gp");
+                appendOscString (packet, ",");
+                oscSocket->write ("127.0.0.1", oscPort, packet.data(), (int) packet.size());
+                paramsRequested = true;
             }
 
             m4lb::log (connected ? "shim connected" : "shim did not connect");

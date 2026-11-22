@@ -15,6 +15,8 @@ struct PatchOptions
     bool midiProbe = false;   // test aid: log every message outlet of shimOut
     int udpPort = 0;          // OSC port the Max patch listens on
     uint32_t instanceId = 0;  // shared-memory key (0 = derive from Max pid)
+    int feedbackPort = 0;     // OSC port the Max side sends parameter info to
+    bool debugLog = false;    // write ctl.js diagnostics
 };
 
 // Builds the JSON text of a .maxpat that wires:

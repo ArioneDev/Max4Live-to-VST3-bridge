@@ -66,18 +66,34 @@ juce::var makeLine (const juce::String& srcId, int srcOutlet,
 juce::String controlScript()
 {
     // Receives OSC-style messages from the bridge over UDP and turns them into
-    // amxd~ messages.  Also logs what arrived, which makes field debugging
-    // possible without a console.
+    // amxd~ messages.  Also logs what arrived and what is sent, which makes
+    // field debugging possible without a console.
     return "autowatch = 1;\n"
            "inlets = 1;\n"
-           "outlets = 2;\n"
+           "outlets = 3;\n"
            "var logDir = jsarguments.length > 1 ? jsarguments[1] : \"\";\n"
            "var tag = jsarguments.length > 2 ? jsarguments[2] : \"ctl\";\n"
+           "var fbPort = jsarguments.length > 3 ? jsarguments[3] : 0;\n"
+           "var debug = jsarguments.length > 4 ? jsarguments[4] : 0;\n"
            "var n = 0;\n"
+           "var names = []; var mins = []; var maxs = [];\n"
+           "var state = 0; var cur = 0; var curName = \"\"; var curMin = 0; var curMax = 1;\n"
            "function log(s) {\n"
-           "  if (!logDir) return;\n"
-           "  var f = new File(logDir + \"/\" + tag + \"_\" + (n++) + \".txt\", \"write\");\n"
+           "  if (!debug || !logDir) return;\n"
+           "  var f = new File(logDir + \"/\" + tag + \"_\" + (n++ % 200) + \".txt\", \"write\");\n"
            "  f.open(); f.writeline(s); f.close();\n"
+           "}\n"
+           "function back(m) {\n"
+           "  if (!fbPort) return;\n"
+           "  log(\"back \" + m.join(\" \"));\n"
+           "  outlet(2, m);\n"
+           "}\n"
+           "function toAmxd(m) {\n"
+           "  if (typeof m == \"string\") { log(\"out \" + m); outlet(0, m); return; }\n"
+           "  if (!m || m.length < 1) return;\n"
+           "  if (typeof m[0] != \"string\" || m[0].length < 1) { log(\"skip \" + m.join(\" \")); return; }\n"
+           "  log(\"out \" + m.join(\" \"));\n"
+           "  outlet(0, m);\n"
            "}\n"
            "function anything() {\n"
            "  var name = messagename;\n"
@@ -86,12 +102,38 @@ juce::String controlScript()
            "  log(name + \" \" + a.join(\" \"));\n"
            "  if (name == \"m\" && a.length >= 2) {\n"
            "    var b2 = a.length > 2 ? a[2] : 0;\n"
-           "    outlet(0, [\"midievent\", a[0], a[1], b2]);\n"
+           "    toAmxd([\"midievent\", a[0], a[1], b2]);\n"
            "  } else if (name == \"p\" && a.length >= 2) {\n"
-           "    outlet(0, [a[0], a[1]]);\n"
+           "    var i = a[0];\n"
+           "    if (i >= 0 && i < names.length && names[i] && String(names[i]).length > 0)\n"
+           "      toAmxd([String(names[i]), a[1]]);\n"
+           "    else log(\"skip param \" + i);\n"
            "  } else if (name == \"t\" && a.length >= 1) {\n"
            "    outlet(1, [\"tempo\", a[0]]);\n"
+           "  } else if (name == \"gp\") {\n"
+           "    names = []; mins = []; maxs = []; state = 1;\n"
+           "    toAmxd(\"getparams\");\n"
+           "  } else if (name == \"info\") {\n"
+           "    var k = a[0];\n"
+           "    if (state == 1) {\n"
+           "      if (k == \"param\") names.push(String(a[1]));\n"
+           "      else if (k == \"done\") { state = 2; cur = 0; askInfo(); }\n"
+           "    } else if (state == 2) {\n"
+           "      if (k == \"name\") curName = String(a[1]);\n"
+           "      else if (k == \"min\") curMin = a[1];\n"
+           "      else if (k == \"max\") curMax = a[1];\n"
+           "      else if (k == \"done\") {\n"
+           "        mins.push(curMin); maxs.push(curMax);\n"
+           "        back([\"pd\", cur, curMin, curMax, curName]);\n"
+           "        cur++;\n"
+           "        if (cur < names.length) askInfo(); else state = 0;\n"
+           "      }\n"
+           "    }\n"
            "  }\n"
+           "}\n"
+           "function askInfo() {\n"
+           "  if (cur < names.length) toAmxd([\"getinfo\", String(names[cur])]);\n"
+           "  else state = 0;\n"
            "}\n";
 }
 
@@ -176,8 +218,8 @@ juce::String buildPatch (const PatchOptions& options)
             boxes.add (makeBox ("obj-62", "newobj", "udpreceive " + juce::String (options.udpPort),
                                 1, 1, { "" }, 420, 40, 140, 22));
             boxes.add (makeBox ("obj-61", "newobj",
-                                "js ctl.js " + maxSymbol (logDir) + " " + juce::String (options.udpPort),
-                                1, 2, { "", "" }, 420, 80, 220, 22));
+                                "js ctl.js " + maxSymbol (logDir) + " " + juce::String (options.udpPort) + " " + juce::String (options.feedbackPort) + " " + (options.debugLog ? "1" : "0"),
+                                1, 3, { "", "", "" }, 420, 80, 220, 22));
 
             // Setting the global transport tempo is done through the
             // [transport] object's "tempo" attribute.
@@ -186,7 +228,16 @@ juce::String buildPatch (const PatchOptions& options)
 
             lines.add (makeLine ("obj-62", 0, "obj-61", 0));
             lines.add (makeLine ("obj-61", 0, devBox, 0));  // midievent / param messages
+            lines.add (makeLine (devBox, 3, "obj-61", 0));  // amxd~ parameter info
             lines.add (makeLine ("obj-61", 1, "obj-66", 0)); // tempo
+
+            if (options.feedbackPort > 0)
+            {
+                boxes.add (makeBox ("obj-67", "newobj",
+                                    "udpsend 127.0.0.1 " + juce::String (options.feedbackPort),
+                                    1, 0, {}, 660, 120, 160, 22));
+                lines.add (makeLine ("obj-61", 2, "obj-67", 0)); // param info back to host
+            }
         }
         lines.add (makeLine (devBox, 0, inBox, 0));
         lines.add (makeLine (devBox, 1, inBox, 1));
